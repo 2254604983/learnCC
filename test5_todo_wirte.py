@@ -25,7 +25,30 @@ MODEL = "qwen-turbo"
 
 WORKDIR = Path.cwd()
 
-SYSTEM = f"You are a coding agent at {WORKDIR}. Use bash to solve tasks. Act, don't explain."
+SYSTEM = (f"You are a coding agent at {WORKDIR}. Use bash to solve tasks. Act, don't explain."
+          "Before starting any multi-step task, use todo_write to plan your steps. "
+          "Update status as you go."
+          )
+
+
+
+# ═══════════════════════════════════════════════════════════
+#  NEW in s05: todo_write tool — plan only, no execution
+# ═══════════════════════════════════════════════════════════
+
+CURRENT_TODOS:list[dict] = []
+
+def run_todo_write(todos:list) ->str:
+    global CURRENT_TODOS
+    CURRENT_TODOS = todos
+
+    lines = ["\n## Current Tasks"]
+    for t in CURRENT_TODOS:
+        icon = {"pending": " ", "in_progress": "▸", "completed": "✓"}[t["status"]]
+        lines.append(f"  [{icon}] {t['content']}")
+    print("\n".join(lines))
+    return f"Updated {len(CURRENT_TODOS)} tasks"
+
 
 TOOLS = [
     {"name": "bash", "description": "Run a shell command.",
@@ -38,6 +61,23 @@ TOOLS = [
      "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "old_text": {"type": "string"}, "new_text": {"type": "string"}}, "required": ["path", "old_text", "new_text"]}},
     {"name": "glob", "description": "Find files matching a glob pattern.",
      "input_schema": {"type": "object", "properties": {"pattern": {"type": "string"}}, "required": ["pattern"]}},
+    {"name": "todo_write", "description": "Create and manage a task list ...",
+     "input_schema": {
+         "type": "object",
+         "properties": {
+             "todos": {
+                 "type": "array",
+                 "items": {
+                     "type": "object",
+                     "properties": {
+                         "content": {"type": "string"},
+                         "status": {"type": "string", "enum": ["pending", "in_progress", "completed"]},
+                     },
+                 },
+             },
+         },
+     },
+     },
 ]
 
 
@@ -50,7 +90,7 @@ def run_bash(command:str) -> str:
     if any(d in command for d in dangerous):
         return "Error: Dangerous command blocked"
     try:
-        r = subprocess.run(command,shell=True,cwd=os.getcwd(),
+        r = subprocess.run(command,shell=True,cwd=WORKDIR,
                            capture_output=True,text=True,timeout=120)
         out = (r.stdout + r.stderr).strip()
         return out[:50000] if out else "(no output)"
@@ -107,7 +147,7 @@ def run_glob(pattern: str) -> str:
 
 TOOL_HANDLERS = {
     "bash": run_bash, "read_file": run_read, "write_file": run_write,
-    "edit_file": run_edit, "glob": run_glob,
+    "edit_file": run_edit, "glob": run_glob,"todo_write":run_todo_write,
 }
 
 # ═══════════════════════════════════════════════════════════
@@ -159,8 +199,104 @@ def check_permission(block) -> bool:
             return False
     return True
 
+# ═══════════════════════════════════════════════════════════
+#  NEW in s04: Hook System (s03 permission logic now via hooks)
+# ═══════════════════════════════════════════════════════════
+HOOKS = {"UserPromptSubmit": [], "PreToolUse": [], "PostToolUse": [], "Stop": []}
+
+def register_hook(event:str,callback):
+    HOOKS[event].append(callback)
+
+def trigger_hooks(event:str,*args):
+    for callback in HOOKS[event]:
+        result = callback(*args)
+        if result is not None:
+            return result
+    return None
+
+
+# s03 permission check logic, now wrapped as a hook
+DENY_LIST = ["rm -rf /", "sudo", "shutdown", "reboot", "mkfs", "dd if="]
+DESTRUCTIVE = ["rm ", "> /etc/", "chmod 777"]
+
+
+def permission_hook(block):
+    """PreToolUse: s03 check_permission() logic moved here."""
+    if block.name == "bash":
+        for pattern in DENY_LIST:
+            if pattern in block.input.get("command", ""):
+                print(f"\n\033[31m⛔ Blocked: '{pattern}'\033[0m")
+                return "Permission denied by deny list"
+        for kw in DESTRUCTIVE:
+            if kw in block.input.get("command", ""):
+                print(f"\n\033[33m⚠  Potentially destructive command\033[0m")
+                print(f"   Tool: {block.name}({block.input})")
+                choice = input("   Allow? [y/N] ").strip().lower()
+                if choice not in ("y", "yes"):
+                    return "Permission denied by user"
+    if block.name in ("write_file", "edit_file"):
+        path = block.input.get("path", "")
+        if not (WORKDIR / path).resolve().is_relative_to(WORKDIR):
+            print(f"\n\033[33m⚠  Writing outside workspace\033[0m")
+            print(f"   Tool: {block.name}({block.input})")
+            choice = input("   Allow? [y/N] ").strip().lower()
+            if choice not in ("y", "yes"):
+                return "Permission denied by user"
+    return None
+
+
+def log_hook(block):
+    """PreToolUse: log every tool call."""
+    args_preview = str(list(block.input.values())[:2])[:60]
+    print(f"\033[90m[HOOK] {block.name}({args_preview})\033[0m")
+    return None
+
+
+# UserPromptSubmit hook: log user input before it reaches the LLM
+def context_inject_hook(query:str):
+    print(f"\033[90m[HOOK] UserPromptSubmit: working in {WORKDIR}\033[0m")
+    return None
+
+# Stop hook: print summary when loop is about to exit
+"""
+    本次会话调用了多少次工具
+    messages: list 通常是整个对话历史
+    
+    tool_count = 0
+    for m in messages:
+        ...
+        if 条件满足:
+            tool_count += 1
+    
+"""
+def summary_hook(messages: list):
+    tool_count = sum(1 for m in messages
+                     for b in (m.get("content") if isinstance(m.get("content"), list) else [])
+                     if isinstance(b, dict) and b.get("type") == "tool_result")
+    print(f"\033[90m[HOOK] Stop: session used {tool_count} tool calls\033[0m")
+    return None
+
+register_hook("UserPromptSubmit",context_inject_hook )
+register_hook("PreToolUse", permission_hook)
+register_hook("PreToolUse", log_hook)
+register_hook("Stop", summary_hook)
+
+
+# ═══════════════════════════════════════════════════════════
+#  agent_loop — same as s04 + nag reminder counter
+# ═══════════════════════════════════════════════════════════
+
+rounds_since_todo = 0
+
 def agent_loop(messages:list):
+    global rounds_since_todo
     while True:
+        # s05 nag reminder — inject if model hasn't updated todos for 3 rounds
+        if rounds_since_todo >= 3 and messages:
+            messages.append({"role": "user",
+                             "content": "<reminder>Update your todos.</reminder>"})
+            rounds_since_todo = 0
+
         response = client.messages.create(
             model=MODEL, system=SYSTEM, messages=messages,
             tools=TOOLS, max_tokens=8000,
@@ -168,39 +304,59 @@ def agent_loop(messages:list):
         messages.append({"role":"assistant","content":response.content})
         # stop_reason 属性，告诉程序"AI 为什么停止生成回复了"
         if response.stop_reason != "tool_use":
-                return
+            force = trigger_hooks("Stop", messages)
+            if force:
+                messages.append({"role": "user", "content": force})
+                continue
+            return
+
+        rounds_since_todo += 1
+
         results = []
         for block in response.content:
-            if block.type == "tool_use":
-                print(f"\033[36m> {block.name}\033[0m")
-                if not check_permission(block):  # ← 新增
-                    results.append({"type": "tool_result", "tool_use_id": block.id,
-                                    "content": "Permission denied."})
-                    continue
-                handler = TOOL_HANDLERS.get(block.name)
-                output = handler(**block.input) if handler else f"Unknown: {block.name}"
-                print(output[:200])
-                results.append({
-                    "type": "tool_result",
-                    "tool_use_id": block.id,
-                    "content": output,
-                })
+            if block.type != "tool_use":
+                continue
+
+            # s04 change: hook replaces hard-coded check_permission()
+            blocked = trigger_hooks("PreToolUse", block)
+            if blocked:
+                results.append({"type": "tool_result", "tool_use_id": block.id,
+                                "content": str(blocked)})
+                continue
+
+
+            handler = TOOL_HANDLERS.get(block.name)
+            # ** 是字典解包，等于把字典展开成关键字参数
+            output = handler(**block.input) if handler else f"Unknown: {block.name}"
+
+            trigger_hooks("PostToolUse", block, output)  # s04: post hook
+
+            # s05: reset nag counter when todo_write is called
+            if block.name == "todo_write":
+                rounds_since_todo = 0
+
+            results.append({
+                "type": "tool_result",
+                "tool_use_id": block.id,
+                "content": output,
+            })
         messages.append({
             "role": "user",
             "content": results
         })
 
 if __name__ == "__main__":
-    print("s03: Permission")
+    print("s05: TodoWrite — plan before execute, nag if you forget")
     print("输入问题，回车发送。输入 q 退出。\n")
     history = []
     while True:
         try:
-            query = input("\033[36ms03 >> \033[0m")
+            query = input("\033[36ms05 >> \033[0m")
         except(EOFError, KeyboardInterrupt):
             break
         if query.strip().lower() in ("q","exit",""):
             break
+        trigger_hooks("UserPromptSubmit", query)
         history.append({"role":"user","content":query})
         agent_loop(history)
         for block in history[-1]["content"]:
